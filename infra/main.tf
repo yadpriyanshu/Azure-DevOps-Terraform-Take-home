@@ -22,6 +22,8 @@ provider "azurerm" {
   # - client_id / client_secret (or use managed identities)
 }
 
+data "azurerm_client_config" "current" {}
+
 locals {
   # Map environment to realm, used for naming and tags.
   realm_by_env = {
@@ -30,6 +32,20 @@ locals {
   }
 
   realm = local.realm_by_env[var.environment]
+
+  vnet_address_space_by_env = {
+    dev  = "10.10.0.0/16"
+    prod = "10.20.0.0/16"
+  }
+
+  vnet_address_space = local.vnet_address_space_by_env[var.environment]
+
+  subnet_address_prefixes_by_env = {
+    dev  = "10.10.1.0/24"
+    prod = "10.20.1.0/24"
+  }
+
+  subnet_address_prefixes = local.subnet_address_prefixes_by_env[var.environment]
 
   common_tags = merge(
     var.tags,
@@ -58,27 +74,16 @@ resource "azurerm_resource_group" "middleearth" {
 resource "azurerm_virtual_network" "middleearth" {
   name                = "vnet-${local.realm}-${var.environment}"
   resource_group_name = azurerm_resource_group.middleearth.name
-
-  # FIXME: Make sure this address space is sensible and can be split
-  # for multiple subnets and environments (dev/prod).
-  address_space = [
-    "10.10.0.0/16"
-  ]
-
-  location = azurerm_resource_group.middleearth.location
-  tags     = local.common_tags
+  address_space       = [local.vnet_address_space]
+  location            = azurerm_resource_group.middleearth.location
+  tags                = local.common_tags
 }
 
 resource "azurerm_subnet" "shire_app" {
   name                 = "snet-${local.realm}-app-${var.environment}"
   resource_group_name  = azurerm_resource_group.middleearth.name
   virtual_network_name = azurerm_virtual_network.middleearth.name
-
-  # FIXME: Ensure this subnet is a valid subset of the VNet address space.
-  # Current value is intentionally suspicious.
-  address_prefixes = [
-    "10.20.1.0/24"
-  ]
+  address_prefixes     = [local.subnet_address_prefixes]
 }
 
 # -----------------------------
@@ -106,8 +111,7 @@ resource "azurerm_app_service" "shire_api" {
   location            = azurerm_resource_group.middleearth.location
   app_service_plan_id = azurerm_app_service_plan.shire_plan.id
 
-  # FIXME: For security, review whether HTTPS-only should be enabled.
-  https_only = false
+  https_only = true
 
   site_config {
     linux_fx_version = "DOTNETCORE|8.0"
@@ -117,13 +121,16 @@ resource "azurerm_app_service" "shire_api" {
     type = "SystemAssigned"
   }
 
-  app_settings = {
-    "WEBSITE_RUN_FROM_PACKAGE" = "1"
-    "REALM"                    = local.realm
-    "ENVIRONMENT"              = var.environment
-    # TODO: In a real setup, secrets would come from Key Vault.
-    # e.g. "ConnectionStrings__Database" retrieved via Key Vault reference.
-  }
+  app_settings = merge(
+    {
+      "WEBSITE_RUN_FROM_PACKAGE" = "1"
+      "REALM"                    = local.realm
+      "ENVIRONMENT"              = var.environment
+    },
+    var.database_connection_string != null ? {
+      "ConnectionStrings__Database" = "@Microsoft.KeyVault(SecretUri=${azurerm_key_vault.one_ring.vault_uri}secrets/${azurerm_key_vault_secret.db_connection[0].name}/)"
+    } : {}
+  )
 
   tags = local.common_tags
 }
@@ -156,15 +163,14 @@ resource "azurerm_key_vault" "one_ring" {
   name                = "kv-${local.realm}-one-ring-${var.environment}"
   resource_group_name = azurerm_resource_group.middleearth.name
   location            = azurerm_resource_group.middleearth.location
+  sku_name            = "standard"
+  tenant_id           = data.azurerm_client_config.current.tenant_id
 
-  # FIXME: Choose an appropriate SKU for this scenario.
-  sku_name = "standard"
-
-  tenant_id = "00000000-0000-0000-0000-000000000000" # FIXME: placeholder – how would this be handled in real code?
-
-  # FIXME: Restrict network access sensibly (no wide-open pattern).
-  # For this exercise, you may leave this as-is, but describe what you
-  # would do in a real environment in QUESTIONS.md.
+  network_acls {
+    default_action             = "Deny"
+    bypass                     = "AzureServices"
+    virtual_network_subnet_ids = [azurerm_subnet.shire_app.id]
+  }
 
   purge_protection_enabled   = false
   soft_delete_retention_days = 7
@@ -172,36 +178,32 @@ resource "azurerm_key_vault" "one_ring" {
   tags = local.common_tags
 }
 
-# TODO:
-# Wire up an access policy so that the shire-api can read secrets using its
-# managed identity (system- or user-assigned). You may choose one approach
-# and implement it.
+resource "azurerm_key_vault_secret" "db_connection" {
+  count        = var.database_connection_string != null ? 1 : 0
+  name         = "ConnectionStrings--Database"
+  value        = var.database_connection_string
+  key_vault_id = azurerm_key_vault.one_ring.id
 
-# Example (incomplete, for you to fix/finish):
-#
-# resource "azurerm_key_vault_access_policy" "shire_api" {
-#   key_vault_id = azurerm_key_vault.one_ring.id
-#
-#   tenant_id = azurerm_key_vault.one_ring.tenant_id
-#   object_id = azurerm_app_service.shire_api.identity[0].principal_id
-#
-#   secret_permissions = [
-#     "Get",
-#     "List"
-#   ]
-# }
+  tags = local.common_tags
+}
+
+resource "azurerm_key_vault_access_policy" "shire_api" {
+  key_vault_id = azurerm_key_vault.one_ring.id
+
+  tenant_id = data.azurerm_client_config.current.tenant_id
+  object_id = azurerm_app_service.shire_api.identity[0].principal_id
+
+  secret_permissions = [
+    "Get",
+    "List"
+  ]
+}
 
 # -----------------------------
-# Hints for dev/prod split
+# Dev/prod split
 # -----------------------------
 #
-# - Currently, this configuration assumes a single environment via var.environment.
-# - For this exercise, you can:
-#   - Use different values of var.environment (dev/prod) with separate state files, OR
-#   - Introduce a simple pattern using for_each or modules.
-#
-# - We are not prescribing one “correct” solution; we are interested in your reasoning.
-#
-# TODO:
-#  - Extend this configuration so that a prod (Gondor) environment can be defined
-#    alongside dev (Shire) with minimal duplication and sensible naming.
+# Dev (Shire) and prod (Gondor) are supported via var.environment with separate
+# state files or workspaces (e.g. terraform plan -var-file=prod.tfvars). Naming
+# and CIDRs are driven by locals. To run multiple environments in one config,
+# consider a for_each over environments or a small module.
