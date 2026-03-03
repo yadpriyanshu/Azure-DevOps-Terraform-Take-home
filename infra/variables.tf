@@ -25,8 +25,15 @@ variable "tags" {
   description = "Common tags applied to all resources."
   type        = map(string)
   default = {
-    project    = "middleearth"
-    managed_by = "adroit"
+    project     = "middleearth"
+    managed_by  = "adroit"
     cost_centre = "fellowship"
   }
+}
+
+variable "database_connection_string" {
+  description = "Database connection string stored in Key Vault. In production, set via pipeline or Key Vault (e.g. CI secret); App Service reads it via Key Vault reference."
+  type        = string
+  sensitive   = true
+  default     = null
 }
